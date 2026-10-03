@@ -27,7 +27,8 @@ class DomainService:
         self.clock = clock or SystemClock()
 
     def _now(self) -> str:
-        return self.clock.now().isoformat().replace("+00:00", "Z")
+        # 统一输出秒精度 UTC（YYYY-MM-DDTHH:MM:SSZ），避免系统时钟微秒破坏时间戳格式。
+        return self.clock.now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     def _identifier(self, value: str, field: str) -> str:
         value = str(value).strip()

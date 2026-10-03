@@ -1,5 +1,6 @@
-"""技能赛训协作基础服务的服务端基础包。"""
+"""综合交通协同服务：基础登记能力与国际班列保供运力分配。"""
 
 from .service import DomainService
+from .supply_service import SupplyService
 
-__all__ = ["DomainService"]
+__all__ = ["DomainService", "SupplyService"]
