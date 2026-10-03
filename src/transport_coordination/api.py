@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
+from .supply import SupplyService
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -21,6 +22,7 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    segments = [segment for segment in parsed.path.split("/") if segment]
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -48,11 +50,80 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        result = _supply_route(service, method, segments, parsed.query, body, actor_id)
+        if result is not None:
+            return result
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _supply_route(service, method: str, segments: list[str], query: str,
+                  body: dict[str, Any], actor_id: str):
+    """保供运力相关路由；返回 None 表示未命中。"""
+
+    supply = getattr(service, "supply", None)
+    if supply is None:
+        return None
+    query_pairs = parse_qs(query)
+    receipt_targets = {
+        ("POST", ("corridors",)): supply.register_corridor,
+        ("POST", ("customer-groups",)): supply.register_group,
+        ("POST", ("customers",)): supply.register_customer,
+        ("POST", ("policy-versions",)): supply.register_policy_version,
+        ("POST", ("train-versions",)): supply.register_train_version,
+        ("POST", ("demands",)): supply.submit_demand,
+        ("POST", ("exceptions",)): supply.propose_exception,
+    }
+    for (http_method, path_segments), handler in receipt_targets.items():
+        if method == http_method and tuple(segments) == path_segments:
+            receipt = handler(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+
+    if method == "POST" and len(segments) == 3 and segments[0] == "demands":
+        demand_id = segments[1]
+        if segments[2] == "confirm":
+            receipt = supply.confirm_demand(actor_id=actor_id, demand_id=demand_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if segments[2] == "waive":
+            receipt = supply.waive_demand(actor_id=actor_id, demand_id=demand_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if segments[2] == "shipment":
+            receipt = supply.record_shipment(actor_id=actor_id, demand_id=demand_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+    if method == "POST" and len(segments) == 3 and segments[0] == "train-versions":
+        version_id = segments[1]
+        if segments[2] == "freeze":
+            receipt = supply.freeze_demand_book(actor_id=actor_id, version_id=version_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if segments[2] == "capacity":
+            receipt = supply.adjust_capacity(actor_id=actor_id, version_id=version_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if segments[2] == "cancel":
+            receipt = supply.cancel_train(actor_id=actor_id, version_id=version_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+    if method == "POST" and len(segments) == 3 and segments[0] == "exceptions" and segments[2] == "decision":
+        receipt = supply.decide_exception(actor_id=actor_id, exception_id=segments[1], **body)
+        return 200 if receipt.replayed else 201, receipt.__dict__
+    if method == "GET" and len(segments) == 2 and segments[0] == "demands":
+        return 200, supply.get_demand_view(segments[1])
+    if method == "GET" and tuple(segments) == ("runs",):
+        version_id = query_pairs.get("version_id", [""])[0]
+        if not version_id:
+            raise ValidationError("version_id 不能为空")
+        return 200, {"items": supply.list_runs(version_id)}
+    if method == "GET" and len(segments) == 2 and segments[0] == "runs":
+        return 200, supply.get_run(segments[1])
+    if method == "GET" and len(segments) == 3 and segments[0] == "runs" and segments[2] == "recompute":
+        return 200, supply.recompute_run(segments[1])
+    if method == "GET" and tuple(segments) == ("policy-comparison",):
+        version_id = query_pairs.get("version_id", [""])[0]
+        ids = query_pairs.get("policy_version_ids", [""])[0].split(",")
+        ids = [item.strip() for item in ids if item.strip()]
+        return 200, supply.compare_policies(version_id=version_id, policy_version_ids=ids)
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,7 +170,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    domain_service = DomainService(database)
+    domain_service.supply = SupplyService(database)
+    Handler.service = domain_service
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
